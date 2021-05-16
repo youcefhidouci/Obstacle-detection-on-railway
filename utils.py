@@ -1,260 +1,381 @@
-import numpy as np
-import os
 import cv2
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
+import random
+import colorsys
+import numpy as np
+import tensorflow as tf
+from core.config import cfg
 
-
-def get_M_Minv():
-    #src = np.float32([[(600, 1080), (850, 300), (1600, 1080), (1000, 300)]])
-    #dst = np.float32([[(500, 1080), (0, 0), (1500, 1080), (1300, 0)]])-----> RailTest1.mp4
-
-    #src = np.float32([[(680,1080),(920,520),(1245,1080),(995,520)]])
-    #dst = np.float32([[(0, 1080), (0, 0), (1920, 1080), (1920, 0)]])--------->RailTest2.mp4
-    
-    src = np.float32([[(680,1080),(920,520),(1245,1080),(995,520)]])
-    dst = np.float32([[(0, 1080), (0, 0), (1920, 1080), (1920, 0)]])
-    
-    
-    M = cv2.getPerspectiveTransform(src, dst)
-    Minv = cv2.getPerspectiveTransform(dst,src)
-    return M,Minv
-    
-
-def abs_sobel_thresh(img, orient='x', thresh_min=0, thresh_max=255):
-    # Convert to grayscale
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    # Apply x or y gradient with the OpenCV Sobel() function
-    # and take the absolute value
-    if orient == 'x':
-        abs_sobel = np.absolute(cv2.Sobel(gray, cv2.CV_64F, 1, 0))
-    if orient == 'y':
-        abs_sobel = np.absolute(cv2.Sobel(gray, cv2.CV_64F, 0, 1))
-    # Rescale back to 8 bit integer
-    scaled_sobel = np.uint8(255*abs_sobel/np.max(abs_sobel))
-    # Create a copy and apply the threshold
-    binary_output = np.zeros_like(scaled_sobel)
-    # Here I'm using inclusive (>=, <=) thresholds, but exclusive is ok too
-    binary_output[(scaled_sobel >= thresh_min) & (scaled_sobel <= thresh_max)] = 1
-
-    # Return the result
-    return binary_output
-
-def mag_thresh(img, sobel_kernel=3, mag_thresh=(0, 255)):
-    # Convert to grayscale
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    # Take both Sobel x and y gradients
-    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=sobel_kernel)
-    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=sobel_kernel)
-    # Calculate the gradient magnitude
-    gradmag = np.sqrt(sobelx**2 + sobely**2)
-    # Rescale to 8 bit
-    scale_factor = np.max(gradmag)/255 
-    gradmag = (gradmag/scale_factor).astype(np.uint8) 
-    # Create a binary image of ones where threshold is met, zeros otherwise
-    binary_output = np.zeros_like(gradmag)
-    binary_output[(gradmag >= mag_thresh[0]) & (gradmag <= mag_thresh[1])] = 1
-
-    # Return the binary image
-    return binary_output
-
-def dir_threshold(img, sobel_kernel=3, thresh=(0, np.pi/2)):
-    # Grayscale
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    # Calculate the x and y gradients
-    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=sobel_kernel)
-    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=sobel_kernel)
-    # Take the absolute value of the gradient direction, 
-    # apply a threshold, and create a binary image result
-    absgraddir = np.arctan2(np.absolute(sobely), np.absolute(sobelx))
-    binary_output =  np.zeros_like(absgraddir)
-    binary_output[(absgraddir >= thresh[0]) & (absgraddir <= thresh[1])] = 1
-
-    # Return the binary image
-    return binary_output
-
-def hls_select(img,channel='s',thresh=(0, 255)):
-    hls = cv2.cvtColor(img, cv2.COLOR_RGB2HLS)
-    if channel=='h':
-        channel = hls[:,:,0]
-    elif channel=='l':
-        channel=hls[:,:,1]
+def load_freeze_layer(model='yolov4', tiny=False):
+    if tiny:
+        if model == 'yolov3':
+            freeze_layouts = ['conv2d_9', 'conv2d_12']
+        else:
+            freeze_layouts = ['conv2d_17', 'conv2d_20']
     else:
-        channel=hls[:,:,2]
-    binary_output = np.zeros_like(channel)
-    binary_output[(channel > thresh[0]) & (channel <= thresh[1])] = 1
-    return binary_output
+        if model == 'yolov3':
+            freeze_layouts = ['conv2d_58', 'conv2d_66', 'conv2d_74']
+        else:
+            freeze_layouts = ['conv2d_93', 'conv2d_101', 'conv2d_109']
+    return freeze_layouts
 
-def luv_select(img, thresh=(0, 255)):
-    luv = cv2.cvtColor(img, cv2.COLOR_RGB2LUV)
-    l_channel = luv[:,:,0]
-    binary_output = np.zeros_like(l_channel)
-    binary_output[(l_channel > thresh[0]) & (l_channel <= thresh[1])] = 1
-    return binary_output
-
-def lab_select(img, thresh=(0, 255)):
-    lab = cv2.cvtColor(img, cv2.COLOR_RGB2Lab)
-    b_channel = lab[:,:,2]
-    binary_output = np.zeros_like(b_channel)
-    binary_output[(b_channel > thresh[0]) & (b_channel <= thresh[1])] = 1
-    return binary_output
-
-def find_line(binary_warped):
-    # Take a histogram of the bottom half of the image
-    histogram = np.sum(binary_warped[binary_warped.shape[0]//2:,:], axis=0)
-    # Find the peak of the left and right halves of the histogram
-    # These will be the starting point for the left and right lines
-    midpoint = np.int(histogram.shape[0]/2)
-    leftx_base = np.argmax(histogram[:midpoint])
-    rightx_base = np.argmax(histogram[midpoint:]) + midpoint
-    
-    # Choose the number of sliding windows
-    nwindows = 9
-    # Set height of windows
-    window_height = np.int(binary_warped.shape[0]/nwindows)
-    # Identify the x and y positions of all nonzero pixels in the image
-    nonzero = binary_warped.nonzero()
-    nonzeroy = np.array(nonzero[0])
-    nonzerox = np.array(nonzero[1])
-    # Current positions to be updated for each window
-    leftx_current = leftx_base
-    rightx_current = rightx_base
-    # Set the width of the windows +/- margin
-    margin = 100
-    # Set minimum number of pixels found to recenter window
-    minpix = 50
-    # Create empty lists to receive left and right lane pixel indices
-    left_lane_inds = []
-    right_lane_inds = []
-    
-    # Step through the windows one by one
-    for window in range(nwindows):
-        # Identify window boundaries in x and y (and right and left)
-        win_y_low = binary_warped.shape[0] - (window+1)*window_height
-        win_y_high = binary_warped.shape[0] - window*window_height
-        win_xleft_low = leftx_current - margin
-        win_xleft_high = leftx_current + margin
-        win_xright_low = rightx_current - margin
-        win_xright_high = rightx_current + margin
-
-        # Identify the nonzero pixels in x and y within the window
-        good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
-        (nonzerox >= win_xleft_low) &  (nonzerox < win_xleft_high)).nonzero()[0]
-        good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
-        (nonzerox >= win_xright_low) &  (nonzerox < win_xright_high)).nonzero()[0]
-
-        # Append these indices to the lists
-        left_lane_inds.append(good_left_inds)
-        right_lane_inds.append(good_right_inds)
-
-        # If you found > minpix pixels, recenter next window on their mean position
-        if len(good_left_inds) > minpix:
-            leftx_current = np.int(np.mean(nonzerox[good_left_inds]))
-        if len(good_right_inds) > minpix:        
-            rightx_current = np.int(np.mean(nonzerox[good_right_inds]))
-    
-    # Concatenate the arrays of indices
-    left_lane_inds = np.concatenate(left_lane_inds)
-    right_lane_inds = np.concatenate(right_lane_inds)
-    
-    # Extract left and right line pixel positions
-    leftx = nonzerox[left_lane_inds]
-    lefty = nonzeroy[left_lane_inds] 
-    rightx = nonzerox[right_lane_inds]
-    righty = nonzeroy[right_lane_inds] 
-    
-    # Fit a second order polynomial to each
-    left_fit = np.polyfit(lefty, leftx, 3)
-    right_fit = np.polyfit(righty, rightx, 3)
-    
-    return left_fit, right_fit, left_lane_inds, right_lane_inds
-
-def find_line_by_previous(binary_warped,left_fit,right_fit):
-    nonzero = binary_warped.nonzero()
-    nonzeroy = np.array(nonzero[0])
-    nonzerox = np.array(nonzero[1])
-    margin = 100
-    left_lane_inds = ((nonzerox > (left_fit[0]*(nonzeroy**3) + left_fit[1]*(nonzeroy**2) +
-    left_fit[2]*nonzeroy +left_fit[3] - margin)) & (nonzerox < (left_fit[0]*(nonzeroy**3) +
-    left_fit[1]*(nonzeroy**2) + left_fit[2]*nonzeroy + left_fit[3] + margin)))
-    
-    right_lane_inds = ((nonzerox > (right_fit[0]*(nonzeroy**3) + right_fit[1]*(nonzeroy**2) +
-    right_fit[2]*nonzeroy + right_fit[3] - margin)) & (nonzerox < (right_fit[0]*(nonzeroy**3) +
-    right_fit[1]*(nonzeroy**2) + right_fit[2]*nonzeroy + right_fit[3] + margin)))
-    
-    # Again, extract left and right line pixel positions
-    leftx = nonzerox[left_lane_inds]
-    lefty = nonzeroy[left_lane_inds] 
-    rightx = nonzerox[right_lane_inds]
-    righty = nonzeroy[right_lane_inds]
-    # Fit a second order polynomial to each
-    left_fit = np.polyfit(lefty, leftx, 3)
-    right_fit = np.polyfit(righty, rightx, 3)
-    return left_fit, right_fit, left_lane_inds, right_lane_inds
-
-
-def draw_area(undist,binary_warped,Minv,left_fit, right_fit):
-    # Generate x and y values for plotting
-    ploty = np.linspace(0, binary_warped.shape[0]-1, binary_warped.shape[0] )
-    # left_fitx = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
-    # right_fitx = right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2]
-    left_fitx = left_fit[0]*ploty**3 + left_fit[1]*ploty**2 + left_fit[2]*ploty+left_fit[3]
-    right_fitx = right_fit[0]*ploty**3 + right_fit[1]*ploty**2 + right_fit[2]*ploty+right_fit[3]
-    # Create an image to draw the lines on
-    warp_zero = np.zeros_like(binary_warped).astype(np.uint8)
-    color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
-    
-    # Recast the x and y points into usable format for cv2.fillPoly()
-    pts_left = np.array([np.transpose(np.vstack([left_fitx, ploty]))])
-    pts_right = np.array([np.flipud(np.transpose(np.vstack([right_fitx, ploty])))])
-    pts = np.hstack((pts_left, pts_right))
-    # Draw the lane onto the warped blank image
-    cv2.fillPoly(color_warp, np.int_([pts]), (0,255, 0))
-    
-    # Warp the blank back to original image space using inverse perspective matrix (Minv)
-    undist = np.array(undist)
-    newwarp = cv2.warpPerspective(color_warp, Minv, (undist.shape[1], undist.shape[0]))
-    cv2.imwrite('./area.jpg', newwarp)
-    cv2.imshow("new warp",newwarp)
-    # Combine the result with the original image
-    result = cv2.addWeighted(undist, 1, newwarp, 0.3, 0)
-    return result,newwarp
-
-def calculate_curv_and_pos(binary_warped,left_fit, right_fit):
-    # Define y-value where we want radius of curvature
-    ploty = np.linspace(0, binary_warped.shape[0]-1, binary_warped.shape[0] )
-    leftx = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
-    rightx = right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2]
-    # Define conversions in x and y from pixels space to meters
-    ym_per_pix = 30/720 # meters per pixel in y dimension
-    xm_per_pix = 3.7/700 # meters per pixel in x dimension
-    y_eval = np.max(ploty)
-    # Fit new polynomials to x,y in world space
-    left_fit_cr = np.polyfit(ploty*ym_per_pix, leftx*xm_per_pix, 2)
-    right_fit_cr = np.polyfit(ploty*ym_per_pix, rightx*xm_per_pix, 2)
-    # Calculate the new radii of curvature
-    left_curverad = ((1 + (2*left_fit_cr[0]*y_eval*ym_per_pix + left_fit_cr[1])**2)**1.5) / np.absolute(2*left_fit_cr[0])
-    right_curverad = ((1 + (2*right_fit_cr[0]*y_eval*ym_per_pix + right_fit_cr[1])**2)**1.5) / np.absolute(2*right_fit_cr[0])
-    
-    curvature = ((left_curverad + right_curverad) / 2)
-    #print(curvature)
-    lane_width = np.absolute(leftx[719] - rightx[719])
-    lane_xm_per_pix = 3.7 / lane_width
-    veh_pos = (((leftx[719] + rightx[719]) * lane_xm_per_pix) / 2.)
-    cen_pos = ((binary_warped.shape[1] * lane_xm_per_pix) / 2.)
-    distance_from_center = cen_pos - veh_pos
-    return curvature,distance_from_center
-
-
-
-def draw_values(img,curvature,distance_from_center):
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    radius_text = "Radius of Curvature: %sm"%(round(curvature))
-    
-    if distance_from_center>0:
-        pos_flag = 'right'
+def load_weights(model, weights_file, model_name='yolov4', is_tiny=False):
+    if is_tiny:
+        if model_name == 'yolov3':
+            layer_size = 13
+            output_pos = [9, 12]
+        else:
+            layer_size = 21
+            output_pos = [17, 20]
     else:
-        pos_flag= 'left'
-        
-    cv2.putText(img,radius_text,(100,100), font, 1,(255,0,0),2)
-    return img
+        if model_name == 'yolov3':
+            layer_size = 75
+            output_pos = [58, 66, 74]
+        else:
+            layer_size = 110
+            output_pos = [93, 101, 109]
+    wf = open(weights_file, 'rb')
+    major, minor, revision, seen, _ = np.fromfile(wf, dtype=np.int32, count=5)
+
+    j = 0
+    for i in range(layer_size):
+        conv_layer_name = 'conv2d_%d' %i if i > 0 else 'conv2d'
+        bn_layer_name = 'batch_normalization_%d' %j if j > 0 else 'batch_normalization'
+
+        conv_layer = model.get_layer(conv_layer_name)
+        filters = conv_layer.filters
+        k_size = conv_layer.kernel_size[0]
+        in_dim = conv_layer.input_shape[-1]
+
+        if i not in output_pos:
+            # darknet weights: [beta, gamma, mean, variance]
+            bn_weights = np.fromfile(wf, dtype=np.float32, count=4 * filters)
+            # tf weights: [gamma, beta, mean, variance]
+            bn_weights = bn_weights.reshape((4, filters))[[1, 0, 2, 3]]
+            bn_layer = model.get_layer(bn_layer_name)
+            j += 1
+        else:
+            conv_bias = np.fromfile(wf, dtype=np.float32, count=filters)
+
+        # darknet shape (out_dim, in_dim, height, width)
+        conv_shape = (filters, in_dim, k_size, k_size)
+        conv_weights = np.fromfile(wf, dtype=np.float32, count=np.product(conv_shape))
+        # tf shape (height, width, in_dim, out_dim)
+        conv_weights = conv_weights.reshape(conv_shape).transpose([2, 3, 1, 0])
+
+        if i not in output_pos:
+            conv_layer.set_weights([conv_weights])
+            bn_layer.set_weights(bn_weights)
+        else:
+            conv_layer.set_weights([conv_weights, conv_bias])
+
+    # assert len(wf.read()) == 0, 'failed to read all data'
+    wf.close()
+
+
+def read_class_names(class_file_name):
+    names = {}
+    with open(class_file_name, 'r') as data:
+        for ID, name in enumerate(data):
+            names[ID] = name.strip('\n')
+    return names
+
+def load_config(FLAGS):
+    if FLAGS.tiny:
+        STRIDES = np.array(cfg.YOLO.STRIDES_TINY)
+        ANCHORS = get_anchors(cfg.YOLO.ANCHORS_TINY, FLAGS.tiny)
+        XYSCALE = cfg.YOLO.XYSCALE_TINY if FLAGS.model == 'yolov4' else [1, 1]
+    else:
+        STRIDES = np.array(cfg.YOLO.STRIDES)
+        if FLAGS.model == 'yolov4':
+            ANCHORS = get_anchors(cfg.YOLO.ANCHORS, FLAGS.tiny)
+        elif FLAGS.model == 'yolov3':
+            ANCHORS = get_anchors(cfg.YOLO.ANCHORS_V3, FLAGS.tiny)
+        XYSCALE = cfg.YOLO.XYSCALE if FLAGS.model == 'yolov4' else [1, 1, 1]
+    NUM_CLASS = len(read_class_names(cfg.YOLO.CLASSES))
+
+    return STRIDES, ANCHORS, NUM_CLASS, XYSCALE
+
+def get_anchors(anchors_path, tiny=False):
+    anchors = np.array(anchors_path)
+    if tiny:
+        return anchors.reshape(2, 3, 2)
+    else:
+        return anchors.reshape(3, 3, 2)
+
+def image_preprocess(image, target_size, gt_boxes=None):
+
+    ih, iw    = target_size
+    h,  w, _  = image.shape
+
+    scale = min(iw/w, ih/h)
+    nw, nh  = int(scale * w), int(scale * h)
+    image_resized = cv2.resize(image, (nw, nh))
+
+    image_paded = np.full(shape=[ih, iw, 3], fill_value=128.0)
+    dw, dh = (iw - nw) // 2, (ih-nh) // 2
+    image_paded[dh:nh+dh, dw:nw+dw, :] = image_resized
+    image_paded = image_paded / 255.
+
+    if gt_boxes is None:
+        return image_paded
+
+    else:
+        gt_boxes[:, [0, 2]] = gt_boxes[:, [0, 2]] * scale + dw
+        gt_boxes[:, [1, 3]] = gt_boxes[:, [1, 3]] * scale + dh
+        return image_paded, gt_boxes
+
+def draw_bbox(image, bboxes, classes=read_class_names(cfg.YOLO.CLASSES), allowed_classes=list(read_class_names(cfg.YOLO.CLASSES).values()), show_label=True):
+    num_classes = len(classes)
+    image_h, image_w, _ = image.shape
+    hsv_tuples = [(1.0 * x / num_classes, 1., 1.) for x in range(num_classes)]
+    colors = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
+    colors = list(map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)), colors))
+
+    random.seed(0)
+    random.shuffle(colors)
+    random.seed(None)
+
+    out_boxes, out_scores, out_classes, num_boxes = bboxes
+    for i in range(num_boxes[0]):
+        if int(out_classes[0][i]) < 0 or int(out_classes[0][i]) > num_classes: continue
+        coor = out_boxes[0][i]
+        coor[0] = int(coor[0] * image_h)
+        coor[2] = int(coor[2] * image_h)
+        coor[1] = int(coor[1] * image_w)
+        coor[3] = int(coor[3] * image_w)
+
+        fontScale = 0.5
+        score = out_scores[0][i]
+        class_ind = int(out_classes[0][i])
+        class_name = classes[class_ind]
+
+        # check if class is in allowed classes
+        if class_name not in allowed_classes:
+            continue
+        else:
+            bbox_color = colors[class_ind]
+            bbox_thick = int(0.6 * (image_h + image_w) / 600)
+            c1, c2 = (coor[1], coor[0]), (coor[3], coor[2])
+            cv2.rectangle(image, c1, c2, bbox_color, bbox_thick)
+
+            if show_label:
+                bbox_mess = '%s: %.2f' % (classes[class_ind], score)
+                t_size = cv2.getTextSize(bbox_mess, 0, fontScale, thickness=bbox_thick // 2)[0]
+                c3 = (c1[0] + t_size[0], c1[1] - t_size[1] - 3)
+                cv2.rectangle(image, c1, (np.float32(c3[0]), np.float32(c3[1])), bbox_color, -1) #filled
+
+                cv2.putText(image, bbox_mess, (c1[0], np.float32(c1[1] - 2)), cv2.FONT_HERSHEY_SIMPLEX,
+                            fontScale, (0, 0, 0), bbox_thick // 2, lineType=cv2.LINE_AA)
+    return image
+
+def bbox_iou(bboxes1, bboxes2):
+    """
+    @param bboxes1: (a, b, ..., 4)
+    @param bboxes2: (A, B, ..., 4)
+        x:X is 1:n or n:n or n:1
+    @return (max(a,A), max(b,B), ...)
+    ex) (4,):(3,4) -> (3,)
+        (2,1,4):(2,3,4) -> (2,3)
+    """
+    bboxes1_area = bboxes1[..., 2] * bboxes1[..., 3]
+    bboxes2_area = bboxes2[..., 2] * bboxes2[..., 3]
+
+    bboxes1_coor = tf.concat(
+        [
+            bboxes1[..., :2] - bboxes1[..., 2:] * 0.5,
+            bboxes1[..., :2] + bboxes1[..., 2:] * 0.5,
+        ],
+        axis=-1,
+    )
+    bboxes2_coor = tf.concat(
+        [
+            bboxes2[..., :2] - bboxes2[..., 2:] * 0.5,
+            bboxes2[..., :2] + bboxes2[..., 2:] * 0.5,
+        ],
+        axis=-1,
+    )
+
+    left_up = tf.maximum(bboxes1_coor[..., :2], bboxes2_coor[..., :2])
+    right_down = tf.minimum(bboxes1_coor[..., 2:], bboxes2_coor[..., 2:])
+
+    inter_section = tf.maximum(right_down - left_up, 0.0)
+    inter_area = inter_section[..., 0] * inter_section[..., 1]
+
+    union_area = bboxes1_area + bboxes2_area - inter_area
+
+    iou = tf.math.divide_no_nan(inter_area, union_area)
+
+    return iou
+
+
+def bbox_giou(bboxes1, bboxes2):
+    """
+    Generalized IoU
+    @param bboxes1: (a, b, ..., 4)
+    @param bboxes2: (A, B, ..., 4)
+        x:X is 1:n or n:n or n:1
+    @return (max(a,A), max(b,B), ...)
+    ex) (4,):(3,4) -> (3,)
+        (2,1,4):(2,3,4) -> (2,3)
+    """
+    bboxes1_area = bboxes1[..., 2] * bboxes1[..., 3]
+    bboxes2_area = bboxes2[..., 2] * bboxes2[..., 3]
+
+    bboxes1_coor = tf.concat(
+        [
+            bboxes1[..., :2] - bboxes1[..., 2:] * 0.5,
+            bboxes1[..., :2] + bboxes1[..., 2:] * 0.5,
+        ],
+        axis=-1,
+    )
+    bboxes2_coor = tf.concat(
+        [
+            bboxes2[..., :2] - bboxes2[..., 2:] * 0.5,
+            bboxes2[..., :2] + bboxes2[..., 2:] * 0.5,
+        ],
+        axis=-1,
+    )
+
+    left_up = tf.maximum(bboxes1_coor[..., :2], bboxes2_coor[..., :2])
+    right_down = tf.minimum(bboxes1_coor[..., 2:], bboxes2_coor[..., 2:])
+
+    inter_section = tf.maximum(right_down - left_up, 0.0)
+    inter_area = inter_section[..., 0] * inter_section[..., 1]
+
+    union_area = bboxes1_area + bboxes2_area - inter_area
+
+    iou = tf.math.divide_no_nan(inter_area, union_area)
+
+    enclose_left_up = tf.minimum(bboxes1_coor[..., :2], bboxes2_coor[..., :2])
+    enclose_right_down = tf.maximum(
+        bboxes1_coor[..., 2:], bboxes2_coor[..., 2:]
+    )
+
+    enclose_section = enclose_right_down - enclose_left_up
+    enclose_area = enclose_section[..., 0] * enclose_section[..., 1]
+
+    giou = iou - tf.math.divide_no_nan(enclose_area - union_area, enclose_area)
+
+    return giou
+
+
+def bbox_ciou(bboxes1, bboxes2):
+    """
+    Complete IoU
+    @param bboxes1: (a, b, ..., 4)
+    @param bboxes2: (A, B, ..., 4)
+        x:X is 1:n or n:n or n:1
+    @return (max(a,A), max(b,B), ...)
+    ex) (4,):(3,4) -> (3,)
+        (2,1,4):(2,3,4) -> (2,3)
+    """
+    bboxes1_area = bboxes1[..., 2] * bboxes1[..., 3]
+    bboxes2_area = bboxes2[..., 2] * bboxes2[..., 3]
+
+    bboxes1_coor = tf.concat(
+        [
+            bboxes1[..., :2] - bboxes1[..., 2:] * 0.5,
+            bboxes1[..., :2] + bboxes1[..., 2:] * 0.5,
+        ],
+        axis=-1,
+    )
+    bboxes2_coor = tf.concat(
+        [
+            bboxes2[..., :2] - bboxes2[..., 2:] * 0.5,
+            bboxes2[..., :2] + bboxes2[..., 2:] * 0.5,
+        ],
+        axis=-1,
+    )
+
+    left_up = tf.maximum(bboxes1_coor[..., :2], bboxes2_coor[..., :2])
+    right_down = tf.minimum(bboxes1_coor[..., 2:], bboxes2_coor[..., 2:])
+
+    inter_section = tf.maximum(right_down - left_up, 0.0)
+    inter_area = inter_section[..., 0] * inter_section[..., 1]
+
+    union_area = bboxes1_area + bboxes2_area - inter_area
+
+    iou = tf.math.divide_no_nan(inter_area, union_area)
+
+    enclose_left_up = tf.minimum(bboxes1_coor[..., :2], bboxes2_coor[..., :2])
+    enclose_right_down = tf.maximum(
+        bboxes1_coor[..., 2:], bboxes2_coor[..., 2:]
+    )
+
+    enclose_section = enclose_right_down - enclose_left_up
+
+    c_2 = enclose_section[..., 0] ** 2 + enclose_section[..., 1] ** 2
+
+    center_diagonal = bboxes2[..., :2] - bboxes1[..., :2]
+
+    rho_2 = center_diagonal[..., 0] ** 2 + center_diagonal[..., 1] ** 2
+
+    diou = iou - tf.math.divide_no_nan(rho_2, c_2)
+
+    v = (
+        (
+            tf.math.atan(
+                tf.math.divide_no_nan(bboxes1[..., 2], bboxes1[..., 3])
+            )
+            - tf.math.atan(
+                tf.math.divide_no_nan(bboxes2[..., 2], bboxes2[..., 3])
+            )
+        )
+        * 2
+        / np.pi
+    ) ** 2
+
+    alpha = tf.math.divide_no_nan(v, 1 - iou + v)
+
+    ciou = diou - alpha * v
+
+    return ciou
+
+def nms(bboxes, iou_threshold, sigma=0.3, method='nms'):
+    """
+    :param bboxes: (xmin, ymin, xmax, ymax, score, class)
+
+    Note: soft-nms, https://arxiv.org/pdf/1704.04503.pdf
+          https://github.com/bharatsingh430/soft-nms
+    """
+    classes_in_img = list(set(bboxes[:, 5]))
+    best_bboxes = []
+
+    for cls in classes_in_img:
+        cls_mask = (bboxes[:, 5] == cls)
+        cls_bboxes = bboxes[cls_mask]
+
+        while len(cls_bboxes) > 0:
+            max_ind = np.argmax(cls_bboxes[:, 4])
+            best_bbox = cls_bboxes[max_ind]
+            best_bboxes.append(best_bbox)
+            cls_bboxes = np.concatenate([cls_bboxes[: max_ind], cls_bboxes[max_ind + 1:]])
+            iou = bbox_iou(best_bbox[np.newaxis, :4], cls_bboxes[:, :4])
+            weight = np.ones((len(iou),), dtype=np.float32)
+
+            assert method in ['nms', 'soft-nms']
+
+            if method == 'nms':
+                iou_mask = iou > iou_threshold
+                weight[iou_mask] = 0.0
+
+            if method == 'soft-nms':
+                weight = np.exp(-(1.0 * iou ** 2 / sigma))
+
+            cls_bboxes[:, 4] = cls_bboxes[:, 4] * weight
+            score_mask = cls_bboxes[:, 4] > 0.
+            cls_bboxes = cls_bboxes[score_mask]
+
+    return best_bboxes
+
+def freeze_all(model, frozen=True):
+    model.trainable = not frozen
+    if isinstance(model, tf.keras.Model):
+        for l in model.layers:
+            freeze_all(l, frozen)
+def unfreeze_all(model, frozen=False):
+    model.trainable = not frozen
+    if isinstance(model, tf.keras.Model):
+        for l in model.layers:
+            unfreeze_all(l, frozen)
+
